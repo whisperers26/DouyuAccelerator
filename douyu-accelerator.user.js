@@ -125,5 +125,191 @@
 
   if (typeof module === 'object' && module && module.exports) {
     module.exports = core;
+    return;
+  }
+
+  // ---- page runtime ----
+
+  function findMainVideo(root) {
+    let best = null;
+    let bestArea = -1;
+    (function walk(node) {
+      if (!node) return;
+      if (node.tagName === 'VIDEO') {
+        const area = node.clientWidth * node.clientHeight;
+        if (area > bestArea) {
+          best = node;
+          bestArea = area;
+        }
+      }
+      if (node.shadowRoot) walk(node.shadowRoot);
+      for (const child of node.children || []) walk(child);
+    })(root);
+    return best;
+  }
+
+  function bufferedEndAt(video, time) {
+    const ranges = video.buffered;
+    for (let i = 0; i < ranges.length; i++) {
+      if (ranges.start(i) <= time + 0.5 && time <= ranges.end(i)) return ranges.end(i);
+    }
+    return time;
+  }
+
+  function start(win) {
+    let config;
+    try {
+      config = readConfig(win.localStorage.getItem(STORAGE_KEY));
+    } catch (_) {
+      config = { ...DEFAULTS };
+    }
+    if (!config.enabled) {
+      console.info(TAG, 'disabled (localStorage.' + STORAGE_KEY + ')');
+      return;
+    }
+
+    const state = {
+      playlistUrl: null,
+      segments: [],
+      generation: 0,
+      done: new Set(),
+      inflight: new Map(), // index -> AbortController
+      failures: new Map(),
+      video: null,
+      stats: { completed: 0, aborted: 0, failed: 0, bytes: 0 },
+    };
+
+    function resetDownloads() {
+      for (const ctl of state.inflight.values()) ctl.abort();
+      state.inflight.clear();
+      state.done = new Set();
+      state.failures = new Map();
+    }
+
+    async function loadPlaylist(url) {
+      resetDownloads();
+      const generation = ++state.generation;
+      state.playlistUrl = url;
+      state.segments = [];
+      try {
+        const res = await win.fetch(url, { cache: 'no-store' });
+        const segments = parsePlaylist(await res.text(), url);
+        if (generation !== state.generation) return;
+        state.segments = segments;
+        console.info(TAG, 'playlist', redactUrl(url), segments.length + ' segments');
+      } catch (err) {
+        if (generation === state.generation) console.warn(TAG, 'could not load playlist', redactUrl(url), err && err.message);
+      }
+    }
+
+    async function download(index) {
+      const generation = state.generation;
+      const segment = state.segments[index];
+      const ctl = new AbortController();
+      state.inflight.set(index, ctl);
+      let bytes = 0;
+      try {
+        const res = await win.fetch(segment.url, { cache: 'no-store', signal: ctl.signal });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        // Read to the end: the edge only keeps a segment it delivered completely.
+        const reader = res.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytes += value.byteLength;
+        }
+        if (generation !== state.generation) return;
+        state.done.add(index);
+        state.stats.completed++;
+        state.stats.bytes += bytes;
+      } catch (err) {
+        if (generation !== state.generation) return;
+        if (ctl.signal.aborted) {
+          state.stats.aborted++;
+        } else {
+          state.failures.set(index, (state.failures.get(index) || 0) + 1);
+          state.stats.failed++;
+          console.warn(TAG, 'segment ' + index + ' failed:', err && err.message);
+        }
+      } finally {
+        if (state.inflight.get(index) === ctl) state.inflight.delete(index);
+      }
+    }
+
+    function tick() {
+      if (!state.segments.length) return;
+      if (!state.video || !state.video.isConnected) state.video = findMainVideo(win.document.documentElement);
+      const video = state.video;
+      if (!video || video.readyState === 0) return;
+      const currentTime = video.currentTime;
+      const { start: toStart, abort } = planDownloads({
+        segments: state.segments,
+        currentTime,
+        bufferedEnd: bufferedEndAt(video, currentTime),
+        aheadSec: config.aheadSec,
+        concurrency: config.concurrency,
+        done: state.done,
+        inflight: new Set(state.inflight.keys()),
+        failures: state.failures,
+        maxAttempts: MAX_ATTEMPTS,
+      });
+      for (const index of abort) {
+        const ctl = state.inflight.get(index);
+        if (ctl) ctl.abort();
+        state.inflight.delete(index);
+      }
+      for (const index of toStart) download(index);
+    }
+
+    function onResource(name) {
+      if (name === state.playlistUrl || !isPlaylistUrl(name)) return;
+      loadPlaylist(name);
+    }
+
+    function safe(fn) {
+      return function () {
+        try {
+          return fn.apply(this, arguments);
+        } catch (err) {
+          console.warn(TAG, err);
+        }
+      };
+    }
+
+    try {
+      new win.PerformanceObserver(
+        safe((list) => {
+          for (const entry of list.getEntries()) onResource(entry.name);
+        }),
+      ).observe({ type: 'resource', buffered: true });
+    } catch (err) {
+      console.warn(TAG, 'no PerformanceObserver, not running', err);
+      return;
+    }
+    win.setInterval(safe(tick), TICK_MS);
+
+    win.__douyuAccelerator = {
+      config,
+      status() {
+        const video = state.video;
+        const current = video ? segmentIndexAt(state.segments, video.currentTime) : -1;
+        return {
+          playlist: state.playlistUrl && redactUrl(state.playlistUrl),
+          segments: state.segments.length,
+          playingSegment: current,
+          inflight: [...state.inflight.keys()].sort((a, b) => a - b),
+          warmedAhead: [...state.done].filter((i) => i > current).length,
+          ...state.stats,
+          megabytes: Math.round(state.stats.bytes / 1e5) / 10,
+        };
+      },
+    };
+    console.info(TAG, 'running', config);
+  }
+
+  try {
+    start(window);
+  } catch (err) {
+    console.warn(TAG, err);
   }
 })();
